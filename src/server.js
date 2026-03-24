@@ -27,10 +27,27 @@ wss.on("connection", (ws) => {
       // Device registers itself
       if (data.type === "register") {
         ws.deviceId = data.deviceId;
-        devices[data.deviceId] = { ws, deviceName: data.deviceName || data.deviceId, phoneNumber: data.phoneNumber || 'N/A' };
+        devices[data.deviceId] = {
+          ws,
+          deviceName: data.deviceName || data.deviceId,
+          phoneNumber: data.phoneNumber || data.deviceId,
+          battery: data.battery ?? -1,
+          charging: data.charging ?? false,
+          network: data.network || 'Unknown',
+          online: true,
+          lastSeen: new Date().toISOString(),
+        };
         console.log("Device registered:", data.deviceId);
         ws.send(JSON.stringify({ type: "registered", deviceId: data.deviceId }));
       }
+
+      // Device sends updated status (pong)
+      if (data.type === "pong" && devices[data.deviceId]) {
+        devices[data.deviceId].battery = data.battery ?? devices[data.deviceId].battery;
+        devices[data.deviceId].charging = data.charging ?? devices[data.deviceId].charging;
+        devices[data.deviceId].network = data.network || devices[data.deviceId].network;
+      }
+      
 
       // Device sends its contacts list
       if (data.type === "contacts") {
@@ -44,8 +61,10 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (ws.deviceId) {
-      delete devices[ws.deviceId];
+    if (ws.deviceId && devices[ws.deviceId]) {
+      devices[ws.deviceId].online = false;
+      devices[ws.deviceId].ws = null;
+      devices[ws.deviceId].lastSeen = new Date().toISOString();
       console.log("Device disconnected:", ws.deviceId);
     }
   });
@@ -53,12 +72,17 @@ wss.on("connection", (ws) => {
 
 // ─── REST API ────────────────────────────────────────────────────────────────
 
-// GET /devices — connected devices with name
+// GET /devices — all devices with online/offline status
 app.get("/devices", (req, res) => {
   const list = Object.entries(devices).map(([id, info]) => ({
     id,
     name: info.deviceName,
     phoneNumber: info.phoneNumber,
+    battery: info.battery,
+    charging: info.charging,
+    network: info.network,
+    online: info.online ?? true,
+    lastSeen: info.lastSeen || null,
   }));
   res.json(list);
 });
@@ -91,6 +115,24 @@ app.post("/send", (req, res) => {
 
   device.ws.send(JSON.stringify({ type: "send_sms", phone, message }));
   res.json({ success: true });
+});
+
+// POST /send-bulk — send SMS to multiple phones at once
+app.post("/send-bulk", (req, res) => {
+  const { deviceId, phones, message } = req.body;
+
+  if (!deviceId || !Array.isArray(phones) || !message) {
+    return res.status(400).json({ error: "deviceId, phones[], and message are required" });
+  }
+
+  const device = devices[deviceId];
+  if (!device) return res.status(404).json({ error: "Device not connected" });
+
+  phones.forEach((phone) => {
+    device.ws.send(JSON.stringify({ type: "send_sms", phone, message }));
+  });
+
+  res.json({ success: true, queued: phones.length });
 });
 
 // ─── Start ───────────────────────────────────────────────────────────────────
