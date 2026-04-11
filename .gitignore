@@ -5,3 +5,4 @@ node_modules/
 dist/
 coverage/
 .vscode/
+src/firebase-service-account.json
