@@ -407,6 +407,117 @@ setInterval(async () => {
   }
 }, 30000);
 
+// Root endpoint - Browser pe dikhega
+app.get("/", (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Bulk SMS Backend</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: white;
+        }
+        .container {
+          background: rgba(255, 255, 255, 0.1);
+          backdrop-filter: blur(10px);
+          border-radius: 20px;
+          padding: 40px;
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+          max-width: 600px;
+          text-align: center;
+        }
+        h1 { font-size: 2.5em; margin-bottom: 20px; }
+        .status {
+          background: #10b981;
+          padding: 15px 30px;
+          border-radius: 50px;
+          display: inline-block;
+          margin: 20px 0;
+          font-weight: bold;
+          font-size: 1.2em;
+        }
+        .info {
+          background: rgba(255, 255, 255, 0.1);
+          padding: 20px;
+          border-radius: 10px;
+          margin: 20px 0;
+          text-align: left;
+        }
+        .info-item {
+          padding: 10px 0;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .info-item:last-child { border-bottom: none; }
+        .label { font-weight: bold; color: #fbbf24; }
+        .endpoints {
+          background: rgba(0, 0, 0, 0.2);
+          padding: 20px;
+          border-radius: 10px;
+          margin-top: 20px;
+          text-align: left;
+        }
+        .endpoint { padding: 8px 0; font-family: monospace; }
+        .method { 
+          background: #3b82f6; 
+          padding: 4px 8px; 
+          border-radius: 4px; 
+          font-size: 0.8em;
+          margin-right: 10px;
+        }
+        .footer { margin-top: 30px; opacity: 0.8; font-size: 0.9em; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>🚀 Bulk SMS Backend</h1>
+        <div class="status">✅ SERVER IS LIVE!</div>
+        
+        <div class="info">
+          <div class="info-item">
+            <span class="label">🌐 Server URL:</span> ${req.protocol}://${req.get('host')}
+          </div>
+          <div class="info-item">
+            <span class="label">⏰ Started:</span> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
+          </div>
+          <div class="info-item">
+            <span class="label">💾 Database:</span> ${mongoose.connection.readyState === 1 ? '✅ Connected' : '❌ Disconnected'}
+          </div>
+          <div class="info-item">
+            <span class="label">🔥 Firebase:</span> ${firebaseReady ? '✅ Ready' : '⚠️ Not configured'}
+          </div>
+          <div class="info-item">
+            <span class="label">📱 Connected Devices:</span> ${Object.keys(devices).length}
+          </div>
+        </div>
+
+        <div class="endpoints">
+          <h3 style="margin-bottom: 15px;">📋 API Endpoints:</h3>
+          <div class="endpoint"><span class="method">POST</span> /auth/login</div>
+          <div class="endpoint"><span class="method">POST</span> /auth/signup</div>
+          <div class="endpoint"><span class="method">GET</span> /devices</div>
+          <div class="endpoint"><span class="method">POST</span> /send</div>
+          <div class="endpoint"><span class="method">POST</span> /send-bulk</div>
+          <div class="endpoint"><span class="method">GET</span> /history</div>
+          <div class="endpoint"><span class="method">GET</span> /ping</div>
+        </div>
+
+        <div class="footer">
+          <p>🔒 Backend is running and ready to accept requests</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
 app.get("/ping", (req, res) => res.json({ ok: true }));
 
 server.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
