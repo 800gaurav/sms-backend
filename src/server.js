@@ -110,7 +110,15 @@ const Device = mongoose.model("Device", DeviceSchema);
 // ─── Firebase Admin ───────────────────────────────────────────────────────────
 let firebaseReady = false;
 try {
-  admin.initializeApp({ credential: admin.credential.cert(require("./firebase-service-account.json")) });
+  let serviceAccount;
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+    serviceAccount = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8"));
+  } else {
+    serviceAccount = require("./firebase-service-account.json");
+  }
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   firebaseReady = true;
   console.log("✅ Firebase Admin initialized");
 } catch (e) {
