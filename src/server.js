@@ -317,6 +317,7 @@ app.post("/auth/login", async (req, res) => {
       console.log('❌ Invalid password for:', email);
       return res.status(401).json({ error: "Invalid credentials" });
     }
+
     
     
     const token = jwt.sign(
