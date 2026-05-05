@@ -9,7 +9,16 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const app = express();
-app.use(cors());
+
+// CORS configuration
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+}));
+
+app.options('*', cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
@@ -22,7 +31,6 @@ mongoose.connect(process.env.MONGO_URL, {
 })
   .then(async () => {
     console.log("✅ MongoDB connected");
-    // Create default admin user if not exists
     const adminExists = await User.findOne({ email: 'admin@bulksms.com' });
     if (!adminExists) {
       const hashed = await bcrypt.hash('admin123', 10);
@@ -43,7 +51,7 @@ const User = mongoose.model("User", UserSchema);
 
 const NumberListSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-  deviceId: String, // optional - assign list to specific device
+  deviceId: String,
   name: String,
   numbers: [String],
   createdAt: { type: Date, default: Date.now },
@@ -57,8 +65,8 @@ const ScheduledJobSchema = new mongoose.Schema({
   numbers: [String],
   delaySeconds: { type: Number, default: 0 },
   scheduledAt: Date,
-  recurring: { type: String, default: "none" }, // none | daily | weekly
-  status: { type: String, default: "pending" }, // pending | running | done | failed
+  recurring: { type: String, default: "none" },
+  status: { type: String, default: "pending" },
   lastRun: Date,
   createdAt: { type: Date, default: Date.now },
 });
@@ -78,7 +86,7 @@ const MessageHistorySchema = new mongoose.Schema({
   deviceName: String,
   phone: String,
   message: String,
-  status: { type: String, default: "sent" }, // sent | failed
+  status: { type: String, default: "sent" },
   sentAt: { type: Date, default: Date.now },
 });
 const MessageHistory = mongoose.model("MessageHistory", MessageHistorySchema);
@@ -95,12 +103,17 @@ try {
 
 async function sendFcm(fcmToken, phone, message) {
   if (!fcmToken || !firebaseReady) return false;
-  await admin.messaging().send({
-    token: fcmToken,
-    data: { type: "send_sms", phone, message },
-    android: { priority: "high" },
-  });
-  return true;
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      data: { type: "send_sms", phone: String(phone), message: String(message) },
+      android: { priority: "high" },
+    });
+    return true;
+  } catch (e) {
+    console.error("❌ FCM send failed:", e.message);
+    return false;
+  }
 }
 
 // ─── In-memory devices ────────────────────────────────────────────────────────
@@ -122,14 +135,20 @@ function auth(req, res, next) {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-wss.on("connection", (ws) => {
-  console.log("📱 New WebSocket connection");
+console.log("🔌 WebSocket server initialized");
+
+wss.on("connection", (ws, req) => {
+  const clientIp = req.socket.remoteAddress;
+  console.log(`📱 New WebSocket connection from ${clientIp}`);
+  
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw);
+      console.log(`📥 Received: ${data.type} from ${data.deviceId || 'unknown'}`);
+      
       if (data.type === "register") {
         ws.deviceId = data.deviceId;
-        ws.userId = 'admin'; // All devices belong to admin
+        ws.userId = 'admin';
         const existing = devices[data.deviceId] || {};
         devices[data.deviceId] = {
           ws, userId: 'admin',
@@ -142,26 +161,38 @@ wss.on("connection", (ws) => {
           online: true,
           lastSeen: new Date().toISOString(),
         };
-        console.log(`✅ Device registered: ${data.deviceId} | Phone: ${data.phoneNumber}`);
+        console.log(`✅ Device registered: ${data.deviceId}`);
+        console.log(`   Name: ${devices[data.deviceId].deviceName}`);
+        console.log(`   Phone: ${devices[data.deviceId].phoneNumber}`);
+        console.log(`   FCM: ${devices[data.deviceId].fcmToken ? 'Yes' : 'No'}`);
         ws.send(JSON.stringify({ type: "registered", deviceId: data.deviceId }));
       }
+      
       if (data.type === "pong" && devices[data.deviceId]) {
         Object.assign(devices[data.deviceId], {
           battery: data.battery ?? devices[data.deviceId].battery,
           charging: data.charging ?? devices[data.deviceId].charging,
           network: data.network || devices[data.deviceId].network,
+          lastSeen: new Date().toISOString(),
         });
+        console.log(`🏓 Pong from ${data.deviceId}`);
       }
-    } catch (e) { console.error("WS error:", e.message); }
+    } catch (e) { 
+      console.error("❌ WS message error:", e.message); 
+    }
   });
 
   ws.on("close", () => {
-    console.log("📱 WebSocket disconnected");
+    console.log(`🔴 WebSocket disconnected: ${ws.deviceId || 'unknown'}`);
     if (ws.deviceId && devices[ws.deviceId]) {
       devices[ws.deviceId].online = false;
       devices[ws.deviceId].ws = null;
       devices[ws.deviceId].lastSeen = new Date().toISOString();
     }
+  });
+
+  ws.on("error", (error) => {
+    console.error(`❌ WebSocket error: ${error.message}`);
   });
 });
 
@@ -172,22 +203,21 @@ async function dispatchSms(deviceId, phone, message, userId = null) {
   
   let success = false;
   if (device.ws && device.online) {
-    device.ws.send(JSON.stringify({ type: "send_sms", phone, message }));
-    success = true;
+    try {
+      device.ws.send(JSON.stringify({ type: "send_sms", phone, message }));
+      success = true;
+    } catch (e) {
+      console.error("❌ WebSocket SMS dispatch failed:", e.message);
+      success = false;
+    }
   } else if (device.fcmToken) {
-    await sendFcm(device.fcmToken, phone, message);
-    success = true;
+    success = await sendFcm(device.fcmToken, phone, message);
   }
   
-  // Save to history
   if (userId) {
     await MessageHistory.create({
-      userId,
-      deviceId,
-      deviceName: device.deviceName,
-      phone,
-      message,
-      status: success ? "sent" : "failed",
+      userId, deviceId, deviceName: device.deviceName,
+      phone, message, status: success ? "sent" : "failed",
     });
   }
   
@@ -207,19 +237,47 @@ app.post("/auth/signup", async (req, res) => {
 });
 
 app.post("/auth/login", async (req, res) => {
-  const { email, password } = req.body;
-  const user = await User.findOne({ email });
-  if (!user || !(await bcrypt.compare(password, user.password)))
-    return res.status(401).json({ error: "Invalid credentials" });
-  const token = jwt.sign({ id: user._id, name: user.name, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
-  res.json({ token, user: { id: user._id, name: user.name, email: user.email } });
+  try {
+    const { email, password } = req.body;
+    console.log('🔐 Login attempt:', email);
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password required" });
+    }
+    
+    const user = await User.findOne({ email });
+    if (!user) {
+      console.log('❌ User not found:', email);
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+    
+    const isValid = await bcrypt.compare(password, user.password);
+    if (!isValid) {
+      console.log('❌ Invalid password for:', email);
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+    
+    const token = jwt.sign(
+      { id: user._id, name: user.name, email: user.email }, 
+      JWT_SECRET, 
+      { expiresIn: "7d" }
+    );
+    
+    console.log('✅ Login successful:', email);
+    return res.status(200).json({ 
+      token, 
+      user: { id: user._id, name: user.name, email: user.email } 
+    });
+  } catch (error) {
+    console.error('❌ Login error:', error);
+    return res.status(500).json({ error: "Server error" });
+  }
 });
 
 app.get("/auth/me", auth, (req, res) => res.json(req.user));
 
-// ─── Devices (show all for admin) ────────────────────────────────────────────
+// ─── Devices ──────────────────────────────────────────────────────────────────
 app.get("/devices", auth, (req, res) => {
-  // Show all devices for admin user
   const list = Object.entries(devices)
     .map(([id, info]) => ({
       id, name: info.deviceName, phoneNumber: info.phoneNumber,
@@ -227,6 +285,28 @@ app.get("/devices", auth, (req, res) => {
       online: info.online ?? false, hasFcm: !!info.fcmToken, lastSeen: info.lastSeen,
     }));
   res.json(list);
+});
+
+app.post("/devices/register", async (req, res) => {
+  const { deviceId, deviceName, phoneNumber, battery, charging, network, fcmToken } = req.body;
+  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+  
+  const existing = devices[deviceId] || {};
+  devices[deviceId] = {
+    ws: null,
+    userId: 'admin',
+    deviceName: deviceName || deviceId,
+    phoneNumber: phoneNumber || "",
+    battery: battery ?? -1,
+    charging: charging ?? false,
+    network: network || "Unknown",
+    fcmToken: fcmToken || existing.fcmToken || null,
+    online: !!fcmToken,
+    lastSeen: new Date().toISOString(),
+  };
+  
+  console.log(`✅ Device registered via HTTP: ${deviceId} | Phone: ${phoneNumber} | FCM: ${!!fcmToken}`);
+  res.json({ success: true, deviceId });
 });
 
 // ─── Number Lists ─────────────────────────────────────────────────────────────
@@ -265,7 +345,6 @@ app.post("/send", auth, async (req, res) => {
   res.json({ success: true, via: result.via });
 });
 
-// ─── Send Bulk with delay ─────────────────────────────────────────────────────
 app.post("/send-bulk", auth, async (req, res) => {
   const { deviceId, phones, message, delaySeconds = 0 } = req.body;
   if (!deviceId || !Array.isArray(phones) || !message)
@@ -273,7 +352,6 @@ app.post("/send-bulk", auth, async (req, res) => {
 
   res.json({ success: true, queued: phones.length });
 
-  // Send with delay in background
   (async () => {
     for (const phone of phones) {
       await dispatchSms(deviceId, phone, message, req.user.id);
@@ -360,7 +438,7 @@ app.delete("/history", auth, async (req, res) => {
   res.json({ success: true });
 });
 
-// ─── Scheduler: check every 30s ──────────────────────────────────────────────
+// ─── Scheduler ────────────────────────────────────────────────────────────────
 setInterval(async () => {
   const now = new Date();
   const jobs = await ScheduledJob.find({ status: "pending", scheduledAt: { $lte: now } });
@@ -369,33 +447,22 @@ setInterval(async () => {
     console.log(`🕐 Running job ${job._id} — ${job.numbers.length} numbers`);
     (async () => {
       try {
-        const device = devices[job.deviceId];
         for (const phone of job.numbers) {
           await dispatchSms(job.deviceId, phone, job.message, job.userId);
           if (job.delaySeconds > 0) await new Promise(r => setTimeout(r, job.delaySeconds * 1000));
         }
         
-        // Handle recurring jobs
         if (job.recurring === "daily") {
-          // Schedule for next day at same time
           const nextRun = new Date(job.scheduledAt);
           nextRun.setDate(nextRun.getDate() + 1);
-          await ScheduledJob.findByIdAndUpdate(job._id, { 
-            status: "pending", 
-            scheduledAt: nextRun 
-          });
+          await ScheduledJob.findByIdAndUpdate(job._id, { status: "pending", scheduledAt: nextRun });
           console.log(`✅ Job ${job._id} done — Next run: ${nextRun.toLocaleString()}`);
         } else if (job.recurring === "weekly") {
-          // Schedule for next week at same time
           const nextRun = new Date(job.scheduledAt);
           nextRun.setDate(nextRun.getDate() + 7);
-          await ScheduledJob.findByIdAndUpdate(job._id, { 
-            status: "pending", 
-            scheduledAt: nextRun 
-          });
+          await ScheduledJob.findByIdAndUpdate(job._id, { status: "pending", scheduledAt: nextRun });
           console.log(`✅ Job ${job._id} done — Next run: ${nextRun.toLocaleString()}`);
         } else {
-          // One-time job
           await ScheduledJob.findByIdAndUpdate(job._id, { status: "done" });
           console.log(`✅ Job ${job._id} done`);
         }
@@ -407,7 +474,7 @@ setInterval(async () => {
   }
 }, 30000);
 
-// Root endpoint - Browser pe dikhega
+// ─── Root endpoint ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -457,22 +524,6 @@ app.get("/", (req, res) => {
         }
         .info-item:last-child { border-bottom: none; }
         .label { font-weight: bold; color: #fbbf24; }
-        .endpoints {
-          background: rgba(0, 0, 0, 0.2);
-          padding: 20px;
-          border-radius: 10px;
-          margin-top: 20px;
-          text-align: left;
-        }
-        .endpoint { padding: 8px 0; font-family: monospace; }
-        .method { 
-          background: #3b82f6; 
-          padding: 4px 8px; 
-          border-radius: 4px; 
-          font-size: 0.8em;
-          margin-right: 10px;
-        }
-        .footer { margin-top: 30px; opacity: 0.8; font-size: 0.9em; }
       </style>
     </head>
     <body>
@@ -497,21 +548,6 @@ app.get("/", (req, res) => {
             <span class="label">📱 Connected Devices:</span> ${Object.keys(devices).length}
           </div>
         </div>
-
-        <div class="endpoints">
-          <h3 style="margin-bottom: 15px;">📋 API Endpoints:</h3>
-          <div class="endpoint"><span class="method">POST</span> /auth/login</div>
-          <div class="endpoint"><span class="method">POST</span> /auth/signup</div>
-          <div class="endpoint"><span class="method">GET</span> /devices</div>
-          <div class="endpoint"><span class="method">POST</span> /send</div>
-          <div class="endpoint"><span class="method">POST</span> /send-bulk</div>
-          <div class="endpoint"><span class="method">GET</span> /history</div>
-          <div class="endpoint"><span class="method">GET</span> /ping</div>
-        </div>
-
-        <div class="footer">
-          <p>🔒 Backend is running and ready to accept requests</p>
-        </div>
       </div>
     </body>
     </html>
@@ -520,4 +556,18 @@ app.get("/", (req, res) => {
 
 app.get("/ping", (req, res) => res.json({ ok: true }));
 
-server.listen(PORT, () => console.log(`🚀 Server on http://localhost:${PORT}`));
+// ─── Start Server ─────────────────────────────────────────────────────────────
+server.listen(PORT, '0.0.0.0', () => {
+  console.clear();
+  console.log('\n' + '═'.repeat(60));
+  console.log('🎉  BULK SMS BACKEND - SERVER IS LIVE!');
+  console.log('═'.repeat(60));
+  console.log(`✅  Status: RUNNING & READY`);
+  console.log(`🌐  Local URL: http://localhost:${PORT}`);
+  console.log(`📱  WebSocket: ws://localhost:${PORT}`);
+  console.log(`🌍  Network URL: http://10.88.143.49:${PORT}`);
+  console.log(`📱  WebSocket Network: ws://10.88.143.49:${PORT}`);
+  console.log(`⏰  Started: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
+  console.log(`🔧  Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('═'.repeat(60) + '\n');
+});
