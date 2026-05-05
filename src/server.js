@@ -91,6 +91,22 @@ const MessageHistorySchema = new mongoose.Schema({
 });
 const MessageHistory = mongoose.model("MessageHistory", MessageHistorySchema);
 
+const DeviceSchema = new mongoose.Schema({
+  deviceId: { type: String, unique: true, index: true, required: true },
+  userId: { type: String, default: "admin" },
+  deviceName: String,
+  phoneNumber: String,
+  battery: { type: Number, default: -1 },
+  charging: { type: Boolean, default: false },
+  network: { type: String, default: "Unknown" },
+  fcmToken: String,
+  online: { type: Boolean, default: false },
+  lastSeen: Date,
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+const Device = mongoose.model("Device", DeviceSchema);
+
 // ─── Firebase Admin ───────────────────────────────────────────────────────────
 let firebaseReady = false;
 try {
@@ -119,6 +135,30 @@ async function sendFcm(fcmToken, phone, message) {
 // ─── In-memory devices ────────────────────────────────────────────────────────
 const devices = {};
 
+async function saveDevice(deviceId, data = {}) {
+  if (!deviceId) return null;
+
+  const update = {
+    userId: data.userId || "admin",
+    deviceName: data.deviceName || deviceId,
+    phoneNumber: data.phoneNumber || "",
+    battery: data.battery ?? -1,
+    charging: data.charging ?? false,
+    network: data.network || "Unknown",
+    online: data.online ?? false,
+    lastSeen: data.lastSeen ? new Date(data.lastSeen) : new Date(),
+    updatedAt: new Date(),
+  };
+
+  if (data.fcmToken) update.fcmToken = data.fcmToken;
+
+  return Device.findOneAndUpdate(
+    { deviceId },
+    { $set: update, $setOnInsert: { deviceId, createdAt: new Date() } },
+    { upsert: true, new: true }
+  ).lean();
+}
+
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
@@ -141,7 +181,7 @@ wss.on("connection", (ws, req) => {
   const clientIp = req.socket.remoteAddress;
   console.log(`📱 New WebSocket connection from ${clientIp}`);
   
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     try {
       const data = JSON.parse(raw);
       console.log(`📥 Received: ${data.type} from ${data.deviceId || 'unknown'}`);
@@ -149,18 +189,21 @@ wss.on("connection", (ws, req) => {
       if (data.type === "register") {
         ws.deviceId = data.deviceId;
         ws.userId = 'admin';
+        const stored = await Device.findOne({ deviceId: data.deviceId }).lean();
         const existing = devices[data.deviceId] || {};
+        const fcmToken = data.fcmToken || existing.fcmToken || stored?.fcmToken || null;
         devices[data.deviceId] = {
           ws, userId: 'admin',
-          deviceName: data.deviceName || data.deviceId,
-          phoneNumber: data.phoneNumber || "",
+          deviceName: data.deviceName || stored?.deviceName || data.deviceId,
+          phoneNumber: data.phoneNumber || stored?.phoneNumber || "",
           battery: data.battery ?? -1,
           charging: data.charging ?? false,
           network: data.network || "Unknown",
-          fcmToken: data.fcmToken || existing.fcmToken || null,
+          fcmToken,
           online: true,
           lastSeen: new Date().toISOString(),
         };
+        await saveDevice(data.deviceId, devices[data.deviceId]);
         console.log(`✅ Device registered: ${data.deviceId}`);
         console.log(`   Name: ${devices[data.deviceId].deviceName}`);
         console.log(`   Phone: ${devices[data.deviceId].phoneNumber}`);
@@ -173,6 +216,7 @@ wss.on("connection", (ws, req) => {
           battery: data.battery ?? devices[data.deviceId].battery,
           charging: data.charging ?? devices[data.deviceId].charging,
           network: data.network || devices[data.deviceId].network,
+          online: true,
           lastSeen: new Date().toISOString(),
         });
         console.log(`🏓 Pong from ${data.deviceId}`);
@@ -188,6 +232,10 @@ wss.on("connection", (ws, req) => {
       devices[ws.deviceId].online = false;
       devices[ws.deviceId].ws = null;
       devices[ws.deviceId].lastSeen = new Date().toISOString();
+      Device.updateOne(
+        { deviceId: ws.deviceId },
+        { $set: { online: false, lastSeen: new Date(), updatedAt: new Date() } }
+      ).catch(e => console.error("Device offline update failed:", e.message));
     }
   });
 
@@ -198,20 +246,33 @@ wss.on("connection", (ws, req) => {
 
 // ─── Helper: send one SMS ─────────────────────────────────────────────────────
 async function dispatchSms(deviceId, phone, message, userId = null) {
-  const device = devices[deviceId];
+  const stored = await Device.findOne({ deviceId }).lean();
+  const live = devices[deviceId] || {};
+  const device = (stored || live.deviceName) ? {
+    ...stored,
+    ...live,
+    deviceName: live.deviceName || stored?.deviceName || deviceId,
+    phoneNumber: live.phoneNumber || stored?.phoneNumber || "",
+    fcmToken: live.fcmToken || stored?.fcmToken || null,
+  } : null;
   if (!device) return { ok: false, reason: "device_not_found" };
   
   let success = false;
+  let via = null;
   if (device.ws && device.online) {
     try {
       device.ws.send(JSON.stringify({ type: "send_sms", phone, message }));
       success = true;
+      via = "websocket";
     } catch (e) {
       console.error("❌ WebSocket SMS dispatch failed:", e.message);
       success = false;
     }
-  } else if (device.fcmToken) {
+  }
+
+  if (!success && device.fcmToken) {
     success = await sendFcm(device.fcmToken, phone, message);
+    if (success) via = "fcm";
   }
   
   if (userId) {
@@ -221,7 +282,7 @@ async function dispatchSms(deviceId, phone, message, userId = null) {
     });
   }
   
-  if (success) return { ok: true, via: device.ws ? "websocket" : "fcm" };
+  if (success) return { ok: true, via };
   return { ok: false, reason: "offline_no_fcm" };
 }
 
@@ -277,13 +338,39 @@ app.post("/auth/login", async (req, res) => {
 app.get("/auth/me", auth, (req, res) => res.json(req.user));
 
 // ─── Devices ──────────────────────────────────────────────────────────────────
-app.get("/devices", auth, (req, res) => {
-  const list = Object.entries(devices)
-    .map(([id, info]) => ({
-      id, name: info.deviceName, phoneNumber: info.phoneNumber,
-      battery: info.battery, charging: info.charging, network: info.network,
-      online: info.online ?? false, hasFcm: !!info.fcmToken, lastSeen: info.lastSeen,
-    }));
+app.get("/devices", auth, async (req, res) => {
+  const storedDevices = await Device.find().sort("-lastSeen").lean();
+  const merged = new Map();
+
+  for (const info of storedDevices) {
+    merged.set(info.deviceId, {
+      id: info.deviceId,
+      name: info.deviceName,
+      phoneNumber: info.phoneNumber,
+      battery: info.battery,
+      charging: info.charging,
+      network: info.network,
+      online: info.online ?? false,
+      hasFcm: !!info.fcmToken,
+      lastSeen: info.lastSeen,
+    });
+  }
+
+  for (const [id, info] of Object.entries(devices)) {
+    merged.set(id, {
+      id,
+      name: info.deviceName,
+      phoneNumber: info.phoneNumber,
+      battery: info.battery,
+      charging: info.charging,
+      network: info.network,
+      online: info.online ?? false,
+      hasFcm: !!info.fcmToken,
+      lastSeen: info.lastSeen,
+    });
+  }
+
+  const list = Array.from(merged.values());
   res.json(list);
 });
 
@@ -291,19 +378,22 @@ app.post("/devices/register", async (req, res) => {
   const { deviceId, deviceName, phoneNumber, battery, charging, network, fcmToken } = req.body;
   if (!deviceId) return res.status(400).json({ error: "deviceId required" });
   
+  const stored = await Device.findOne({ deviceId }).lean();
   const existing = devices[deviceId] || {};
+  const savedFcmToken = fcmToken || existing.fcmToken || stored?.fcmToken || null;
   devices[deviceId] = {
-    ws: null,
+    ws: existing.ws || null,
     userId: 'admin',
-    deviceName: deviceName || deviceId,
-    phoneNumber: phoneNumber || "",
+    deviceName: deviceName || stored?.deviceName || deviceId,
+    phoneNumber: phoneNumber || stored?.phoneNumber || "",
     battery: battery ?? -1,
     charging: charging ?? false,
     network: network || "Unknown",
-    fcmToken: fcmToken || existing.fcmToken || null,
-    online: !!fcmToken,
+    fcmToken: savedFcmToken,
+    online: existing.online || !!savedFcmToken,
     lastSeen: new Date().toISOString(),
   };
+  await saveDevice(deviceId, devices[deviceId]);
   
   console.log(`✅ Device registered via HTTP: ${deviceId} | Phone: ${phoneNumber} | FCM: ${!!fcmToken}`);
   res.json({ success: true, deviceId });
