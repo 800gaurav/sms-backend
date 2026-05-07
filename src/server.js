@@ -12,13 +12,10 @@ const app = express();
 
 // CORS configuration
 app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  origin: true,
   credentials: true
 }));
 
-app.options('*', cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
