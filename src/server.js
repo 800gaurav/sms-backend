@@ -83,8 +83,11 @@ const MessageHistorySchema = new mongoose.Schema({
   deviceName: String,
   phone: String,
   message: String,
-  status: { type: String, default: "sent" },
+  status: { type: String, default: "queued" },
+  via: String,
+  error: String,
   sentAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
 });
 const MessageHistory = mongoose.model("MessageHistory", MessageHistorySchema);
 
@@ -122,12 +125,21 @@ try {
   console.warn("⚠️  Firebase init failed:", e.message);
 }
 
-async function sendFcm(fcmToken, phone, message) {
+async function sendFcm(fcmToken, phone, message, messageId, deviceId) {
   if (!fcmToken || !firebaseReady) return false;
   try {
+    const publicBackendUrl = process.env.PUBLIC_BACKEND_URL || "https://api.sms.genzteck.com";
+    const statusUrl = `${publicBackendUrl.replace(/\/$/, "")}/sms-status`;
     await admin.messaging().send({
       token: fcmToken,
-      data: { type: "send_sms", phone: String(phone), message: String(message) },
+      data: {
+        type: "send_sms",
+        phone: String(phone),
+        message: String(message),
+        messageId: messageId ? String(messageId) : "",
+        deviceId: deviceId ? String(deviceId) : "",
+        statusUrl,
+      },
       android: { priority: "high" },
     });
     return true;
@@ -226,6 +238,11 @@ wss.on("connection", (ws, req) => {
         });
         console.log(`🏓 Pong from ${data.deviceId}`);
       }
+
+      if (data.type === "sms_status") {
+        await updateMessageStatus(data.messageId, data.deviceId || ws.deviceId, data.status, data.error);
+        console.log(`SMS status ${data.status} for ${data.messageId}`);
+      }
     } catch (e) { 
       console.error("❌ WS message error:", e.message); 
     }
@@ -250,6 +267,21 @@ wss.on("connection", (ws, req) => {
 });
 
 // ─── Helper: send one SMS ─────────────────────────────────────────────────────
+async function updateMessageStatus(messageId, deviceId, status, error = "") {
+  if (!messageId || !["sent", "failed"].includes(status)) return null;
+  return MessageHistory.findOneAndUpdate(
+    { _id: messageId, deviceId },
+    {
+      $set: {
+        status,
+        error: error || "",
+        updatedAt: new Date(),
+      },
+    },
+    { new: true }
+  );
+}
+
 async function dispatchSms(deviceId, phone, message, userId = null) {
   const stored = await Device.findOne({ deviceId }).lean();
   const live = devices[deviceId] || {};
@@ -259,36 +291,62 @@ async function dispatchSms(deviceId, phone, message, userId = null) {
     deviceName: live.deviceName || stored?.deviceName || deviceId,
     phoneNumber: live.phoneNumber || stored?.phoneNumber || "",
     fcmToken: live.fcmToken || stored?.fcmToken || null,
+    ws: live.ws || null,
+    online: live.online ?? stored?.online ?? false,
   } : null;
-  if (!device) return { ok: false, reason: "device_not_found" };
+  
+  const history = userId ? await MessageHistory.create({
+    userId,
+    deviceId,
+    deviceName: device?.deviceName || deviceId,
+    phone,
+    message,
+    status: "queued",
+  }) : null;
+
+  if (!device) {
+    if (history) await updateMessageStatus(history._id, deviceId, "failed", "device_not_found");
+    return { ok: false, reason: "device_not_found", historyId: history?._id };
+  }
   
   let success = false;
   let via = null;
-  if (device.ws && device.online) {
+  
+  // Try WebSocket first if device is online and connected
+  if (device.ws && device.ws.readyState === 1 && device.online) {
     try {
-      device.ws.send(JSON.stringify({ type: "send_sms", phone, message }));
+      device.ws.send(JSON.stringify({ type: "send_sms", phone, message, messageId: history?._id }));
       success = true;
       via = "websocket";
+      console.log(`✅ SMS sent via WebSocket to ${deviceId} for ${phone}`);
     } catch (e) {
       console.error("❌ WebSocket SMS dispatch failed:", e.message);
       success = false;
     }
   }
 
+  // Only try FCM if WebSocket failed or not available
   if (!success && device.fcmToken) {
-    success = await sendFcm(device.fcmToken, phone, message);
-    if (success) via = "fcm";
+    success = await sendFcm(device.fcmToken, phone, message, history?._id, deviceId);
+    if (success) {
+      via = "fcm";
+      console.log(`✅ SMS sent via FCM to ${deviceId} for ${phone}`);
+    }
   }
   
-  if (userId) {
-    await MessageHistory.create({
-      userId, deviceId, deviceName: device.deviceName,
-      phone, message, status: success ? "sent" : "failed",
+  if (history) {
+    await MessageHistory.findByIdAndUpdate(history._id, {
+      $set: {
+        status: success ? "queued" : "failed",
+        via,
+        error: success ? "" : "offline_no_fcm",
+        updatedAt: new Date(),
+      },
     });
   }
   
-  if (success) return { ok: true, via };
-  return { ok: false, reason: "offline_no_fcm" };
+  if (success) return { ok: true, via, historyId: history?._id };
+  return { ok: false, reason: "offline_no_fcm", historyId: history?._id };
 }
 
 // ─── Auth Routes ──────────────────────────────────────────────────────────────
@@ -439,7 +497,7 @@ app.post("/send", auth, async (req, res) => {
   if (!deviceId || !phone || !message) return res.status(400).json({ error: "deviceId, phone, message required" });
   const result = await dispatchSms(deviceId, phone, message, req.user.id);
   if (!result.ok) return res.status(503).json({ error: result.reason });
-  res.json({ success: true, via: result.via });
+  res.json({ success: true, queued: true, via: result.via, historyId: result.historyId });
 });
 
 app.post("/send-bulk", auth, async (req, res) => {
@@ -455,6 +513,13 @@ app.post("/send-bulk", auth, async (req, res) => {
       if (delaySeconds > 0) await new Promise(r => setTimeout(r, delaySeconds * 1000));
     }
   })();
+});
+
+app.post("/sms-status", async (req, res) => {
+  const { messageId, deviceId, status, error } = req.body;
+  const updated = await updateMessageStatus(messageId, deviceId, status, error);
+  if (!updated) return res.status(400).json({ error: "Invalid status update" });
+  res.json({ success: true });
 });
 
 // ─── Scheduled Jobs ───────────────────────────────────────────────────────────
@@ -526,8 +591,9 @@ app.get("/history", auth, async (req, res) => {
   
   const sent = stats.find(s => s._id === "sent")?.count || 0;
   const failed = stats.find(s => s._id === "failed")?.count || 0;
+  const queued = stats.find(s => s._id === "queued")?.count || 0;
   
-  res.json({ history, stats: { sent, failed, total: sent + failed } });
+  res.json({ history, stats: { sent, failed, queued, total: sent + failed + queued } });
 });
 
 app.delete("/history", auth, async (req, res) => {
@@ -573,82 +639,7 @@ setInterval(async () => {
 
 // ─── Root endpoint ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Bulk SMS Backend</title>
-      <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          min-height: 100vh;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: white;
-        }
-        .container {
-          background: rgba(255, 255, 255, 0.1);
-          backdrop-filter: blur(10px);
-          border-radius: 20px;
-          padding: 40px;
-          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-          max-width: 600px;
-          text-align: center;
-        }
-        h1 { font-size: 2.5em; margin-bottom: 20px; }
-        .status {
-          background: #10b981;
-          padding: 15px 30px;
-          border-radius: 50px;
-          display: inline-block;
-          margin: 20px 0;
-          font-weight: bold;
-          font-size: 1.2em;
-        }
-        .info {
-          background: rgba(255, 255, 255, 0.1);
-          padding: 20px;
-          border-radius: 10px;
-          margin: 20px 0;
-          text-align: left;
-        }
-        .info-item {
-          padding: 10px 0;
-          border-bottom: 1px solid rgba(255, 255, 255, 0.2);
-        }
-        .info-item:last-child { border-bottom: none; }
-        .label { font-weight: bold; color: #fbbf24; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1>🚀 Bulk SMS Backend</h1>
-        <div class="status">✅ SERVER IS LIVE!</div>
-        
-        <div class="info">
-          <div class="info-item">
-            <span class="label">🌐 Server URL:</span> ${req.protocol}://${req.get('host')}
-          </div>
-          <div class="info-item">
-            <span class="label">⏰ Started:</span> ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
-          </div>
-          <div class="info-item">
-            <span class="label">💾 Database:</span> ${mongoose.connection.readyState === 1 ? '✅ Connected' : '❌ Disconnected'}
-          </div>
-          <div class="info-item">
-            <span class="label">🔥 Firebase:</span> ${firebaseReady ? '✅ Ready' : '⚠️ Not configured'}
-          </div>
-          <div class="info-item">
-            <span class="label">📱 Connected Devices:</span> ${Object.keys(devices).length}
-          </div>
-        </div>
-      </div>
-    </body>
-    </html>
-  `);
+  res.send('Server is running');
 });
 
 app.get("/ping", (req, res) => res.json({ ok: true }));
